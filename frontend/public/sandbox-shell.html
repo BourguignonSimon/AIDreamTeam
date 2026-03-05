@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<!--
+  React Sandbox Shell — runs inside an isolated <iframe sandbox="allow-scripts">
+
+  Security guarantees:
+  - sandbox="allow-scripts" (no allow-same-origin) → null origin, no access
+    to parent cookies, localStorage, sessionStorage, or IndexedDB.
+  - Content-Security-Policy (set via HTTP header by Next.js config):
+      default-src 'none'
+      script-src  'unsafe-inline' https://unpkg.com
+      style-src   'unsafe-inline'
+      connect-src 'none'          ← user code cannot fetch/XHR/WebSocket
+      img-src     data: blob:
+      font-src    'none'
+      object-src  'none'
+      frame-src   'none'
+      form-action 'none'
+
+  Hot-reload protocol (postMessage):
+  - Parent → iframe: { type: "UPDATE_CODE", code: "<JSX string>" }
+  - iframe → parent: { type: "RENDER_OK" }
+  - iframe → parent: { type: "RENDER_ERROR", message: "...", line: N, col: N }
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!--
+    Fallback CSP via meta tag (HTTP header from server takes precedence).
+    Allows React + ReactDOM + Babel to load from unpkg, but user code
+    executed later is restricted by the sandbox attribute on the iframe.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'unsafe-inline' https://unpkg.com; style-src 'unsafe-inline'; connect-src 'none'; img-src data: blob:; object-src 'none'; frame-src 'none'; form-action 'none';" />
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #ffffff;
+      min-height: 100vh;
+    }
+
+    #root {
+      width: 100%;
+      min-height: 100vh;
+    }
+
+    #sandbox-error {
+      display: none;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #fef2f2;
+      border-top: 2px solid #fca5a5;
+      padding: 12px 16px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      color: #dc2626;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 40vh;
+      overflow-y: auto;
+      z-index: 9999;
+    }
+
+    #sandbox-error .error-title {
+      font-weight: bold;
+      margin-bottom: 4px;
+      font-family: system-ui, sans-serif;
+    }
+
+    #sandbox-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      color: #9ca3af;
+      font-size: 0.95rem;
+    }
+  </style>
+</head>
+<body>
+  <div id="sandbox-placeholder">Waiting for component code…</div>
+  <div id="root"></div>
+  <div id="sandbox-error" role="alert" aria-live="assertive">
+    <div class="error-title">Render Error</div>
+    <span id="sandbox-error-msg"></span>
+  </div>
+
+  <!--
+    Load React ecosystem from unpkg (allowed by CSP script-src above).
+    Versions are pinned to avoid unexpected breakage.
+  -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js"
+          crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"
+          crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"
+          crossorigin="anonymous"></script>
+
+  <script>
+    'use strict';
+
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+
+    var _reactRoot = null;
+    var _lastCode  = null;
+    var _isReady   = false;
+
+    var rootEl        = document.getElementById('root');
+    var placeholderEl = document.getElementById('sandbox-placeholder');
+    var errorEl       = document.getElementById('sandbox-error');
+    var errorMsgEl    = document.getElementById('sandbox-error-msg');
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    function showError(message) {
+      errorEl.style.display    = 'block';
+      errorMsgEl.textContent   = message;
+
+      // Notify parent about the render error
+      try {
+        window.parent.postMessage(
+          { type: 'RENDER_ERROR', message: message },
+          '*'
+        );
+      } catch (_) {}
+    }
+
+    function clearError() {
+      errorEl.style.display  = 'none';
+      errorMsgEl.textContent = '';
+    }
+
+    function getOrCreateRoot() {
+      if (!_reactRoot) {
+        _reactRoot = ReactDOM.createRoot(rootEl);
+      }
+      return _reactRoot;
+    }
+
+    // -----------------------------------------------------------------------
+    // Core renderer
+    // -----------------------------------------------------------------------
+
+    function renderCode(code) {
+      if (!code || code === _lastCode) return;
+      _lastCode = code;
+
+      // Hide placeholder
+      placeholderEl.style.display = 'none';
+      clearError();
+
+      try {
+        // Wrap user code to:
+        //   1. Expose React hooks as globals (no imports needed in user code).
+        //   2. Capture the App export via __sandbox_render__.
+        var wrapped = [
+          '(function(__sandbox_render__, React) {',
+          '  var useState      = React.useState;',
+          '  var useEffect     = React.useEffect;',
+          '  var useCallback   = React.useCallback;',
+          '  var useMemo       = React.useMemo;',
+          '  var useRef        = React.useRef;',
+          '  var useContext    = React.useContext;',
+          '  var useReducer    = React.useReducer;',
+          '  var createContext = React.createContext;',
+          '  var useId         = React.useId;',
+          '',
+          code,
+          '',
+          '  if (typeof App !== "undefined") {',
+          '    __sandbox_render__(React.createElement(App, null));',
+          '  }',
+          '})',
+        ].join('\n');
+
+        // Transform JSX → plain JS
+        var result = Babel.transform(wrapped, {
+          presets:  [['react', { runtime: 'classic' }]],
+          filename: 'sandbox.jsx',
+          retainLines: true,
+        });
+
+        // Execute the transformed IIFE, passing the render callback
+        // eslint-disable-next-line no-new-func
+        var fn = new Function('__sandbox_render__', 'React', result.code);
+        fn(
+          function renderElement(element) {
+            getOrCreateRoot().render(element);
+          },
+          React
+        );
+
+        try {
+          window.parent.postMessage({ type: 'RENDER_OK' }, '*');
+        } catch (_) {}
+
+      } catch (err) {
+        showError(err.message || String(err));
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Message listener — receives UPDATE_CODE from parent
+    // -----------------------------------------------------------------------
+
+    window.addEventListener('message', function(event) {
+      // In sandbox="allow-scripts" (no allow-same-origin) the iframe origin
+      // is null, so we cannot restrict by origin here — instead we validate
+      // the message shape strictly.
+      if (!event.data || typeof event.data !== 'object') return;
+
+      var msg = event.data;
+
+      switch (msg.type) {
+        case 'UPDATE_CODE':
+          if (typeof msg.code === 'string') {
+            renderCode(msg.code);
+          }
+          break;
+
+        case 'PING':
+          // Parent can send PING to verify iframe is ready
+          try {
+            window.parent.postMessage({ type: 'PONG' }, '*');
+          } catch (_) {}
+          break;
+
+        default:
+          break;
+      }
+    });
+
+    // Signal readiness to parent once scripts have loaded
+    window.addEventListener('load', function() {
+      _isReady = true;
+      try {
+        window.parent.postMessage({ type: 'SANDBOX_READY' }, '*');
+      } catch (_) {}
+    });
+  </script>
+</body>
+</html>

@@ -22,9 +22,11 @@ from functools import lru_cache
 from typing import Iterator, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from api.sandbox_ws import router as sandbox_router
 from services.transcription import (
     TranscriptionResult,
     TranscriptionService,
@@ -38,10 +40,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Audio Transcription Service",
-    description="Transcribes audio files using faster-whisper (CTranslate2) with 15s chunking.",
-    version="1.0.0",
+    title="AI Dream Team — API",
+    description="Audio transcription + React sandbox code streaming.",
+    version="1.1.0",
 )
+
+# CORS — allow the Next.js dev server and production frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount WebSocket sandbox routes
+app.include_router(sandbox_router)
 
 
 # ---------------------------------------------------------------------------
